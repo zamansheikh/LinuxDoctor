@@ -730,134 +730,184 @@ EOF
     fi
 }
 
-# --- Advanced SSL Setup with Multiple Methods ---
+# --- Resolve a domain's first IPv4 address (dig -> host -> getent fallback) ---
+resolve_ip() {
+    local d="$1"
+    if command -v dig &>/dev/null; then
+        dig +short A "$d" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+    elif command -v host &>/dev/null; then
+        host -t A "$d" 2>/dev/null | awk '/has address/{print $4; exit}'
+    else
+        getent ahostsv4 "$d" 2>/dev/null | awk '{print $1; exit}'
+    fi
+}
+
+# --- Sanitize a domain for use in a temp filename ---
+safe_name() {
+    echo "${1//[^a-zA-Z0-9._-]/_}"
+}
+
+# --- Final per-domain SSL summary (honest: reads on-disk certs + tracked status) ---
+print_ssl_summary() {
+    echo ""
+    draw_line "─"
+    echo -e "  ${BOLD}${WHITE}SSL Certificate Summary${NC}"
+    draw_line "─"
+    local secured=0 failed=0
+    for domain in "${!domain_ports[@]}"; do
+        local st="${domain_ssl_status[$domain]}"
+        if [[ "$st" == "success" ]]; then
+            echo -e "  ${GREEN}${CHECK}${NC} ${WHITE}https://$domain${NC} ${DIM}→ localhost:${domain_ports[$domain]}${NC}"
+            secured=$((secured + 1))
+        else
+            local reason="${st#failed:}"
+            [[ "$st" == "pending" || -z "$st" ]] && reason="not attempted"
+            echo -e "  ${RED}${CROSS}${NC} ${WHITE}$domain${NC} ${DIM}— HTTP only (${reason})${NC}"
+            failed=$((failed + 1))
+        fi
+    done
+    draw_line "─"
+    echo -e "  ${GREEN}${BOLD}${secured} secured${NC}  ${DIM}|${NC}  ${RED}${BOLD}${failed} failed/skipped${NC}"
+    echo ""
+}
+
+# --- Advanced SSL Setup: DNS pre-flight -> bundle -> per-domain isolation ---
 setup_ssl() {
     if [[ "$SETUP_SSL" != "yes" ]]; then
         return
     fi
-    
+
     print_header "🔐 SSL Certificate Setup (Let's Encrypt)"
 
-    DOMAINS_TO_CERT=()
-    echo ""
-    echo -e "  ${CYAN}${BULLET}${NC} Preparing SSL certificates for:"
-    for domain in "${!domain_ports[@]}"; do
-        DOMAINS_TO_CERT+=("-d" "$domain")
-        echo -e "    ${WHITE}${BULLET}${NC} $domain"
-    done
-
-    if [ ${#DOMAINS_TO_CERT[@]} -eq 0 ]; then
+    if [ ${#domain_ports[@]} -eq 0 ]; then
         print_warning "No domains to secure."
         return
     fi
 
-    # Pre-flight checks
+    # Reset status tracking for an honest summary at the end
+    for domain in "${!domain_ports[@]}"; do
+        domain_ssl_status[$domain]="pending"
+    done
+
+    # Detect this server's public IP once (used to sanity-check DNS records)
+    local public_ip
+    public_ip=$(curl -s --max-time 10 ifconfig.me 2>/dev/null || curl -s --max-time 10 icanhazip.com 2>/dev/null)
+    if [[ -n "$public_ip" ]]; then
+        echo -e "  ${CYAN}${BULLET}${NC} Server public IP: ${WHITE}$public_ip${NC}"
+    fi
+
+    # --- Stage 1: DNS pre-flight (exclude unresolvable domains from the request) ---
     echo ""
-    echo -e "  ${CYAN}${BULLET}${NC} Running pre-flight checks..."
-    
-    # Ensure ACME directory is accessible
+    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Stage 1 — DNS verification${NC}"
+    local -a resolvable=()
+    for domain in "${!domain_ports[@]}"; do
+        local dip
+        dip=$(resolve_ip "$domain")
+        if [[ -z "$dip" ]]; then
+            echo -e "    ${RED}${CROSS}${NC} ${WHITE}$domain${NC} ${DIM}— no DNS A record (NXDOMAIN), skipping${NC}"
+            domain_ssl_status[$domain]="failed:no DNS A record (NXDOMAIN)"
+        elif [[ -n "$public_ip" && "$dip" != "$public_ip" ]]; then
+            echo -e "    ${YELLOW}!${NC} ${WHITE}$domain${NC} ${DIM}→ $dip (server is $public_ip; will still try — may be proxied/CDN)${NC}"
+            resolvable+=("$domain")
+        else
+            echo -e "    ${GREEN}${CHECK}${NC} ${WHITE}$domain${NC} ${DIM}→ $dip${NC}"
+            resolvable+=("$domain")
+        fi
+    done
+
+    if [ ${#resolvable[@]} -eq 0 ]; then
+        echo ""
+        print_error "No domains have valid DNS records — cannot request any certificates."
+        print_ssl_summary
+        ssl_setup_failed
+        return
+    fi
+
+    # --- Stage 2: ACME pre-flight (informational only) ---
+    echo ""
+    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Stage 2 — ACME challenge pre-flight${NC}"
     mkdir -p "$ACME_DIR/.well-known/acme-challenge"
     chown -R www-data:www-data "$ACME_DIR" 2>/dev/null || chown -R nginx:nginx "$ACME_DIR" 2>/dev/null
     chmod -R 755 "$ACME_DIR"
-    
-    # Test ACME access
-    local test_passed=0
-    for domain in "${!domain_ports[@]}"; do
+    for domain in "${resolvable[@]}"; do
         if test_acme_access "$domain"; then
-            echo -e "    ${GREEN}${CHECK}${NC} ACME challenge path accessible for $domain"
-            test_passed=$((test_passed + 1))
+            echo -e "    ${GREEN}${CHECK}${NC} ACME path reachable for $domain"
         else
-            echo -e "    ${YELLOW}!${NC} ACME challenge test failed for $domain (may still work)"
+            echo -e "    ${YELLOW}!${NC} ACME path test failed for $domain ${DIM}(certbot may still succeed)${NC}"
         fi
     done
-    
+
+    # Build -d args only for the domains that actually resolve
+    DOMAINS_TO_CERT=()
+    for domain in "${resolvable[@]}"; do
+        DOMAINS_TO_CERT+=("-d" "$domain")
+    done
+
+    # --- Stage 3: Bundle request (one cert for all resolvable domains) ---
     echo ""
-    
-    # Method 1: Bundle all domains (fastest if it works)
-    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Method 1:${NC} Requesting certificate for all domains together..."
+    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Stage 3 — Bundle request${NC} for ${#resolvable[@]} domain(s)"
     animate_dots "  Contacting Let's Encrypt" 2
-    
-    if certbot certonly --nginx --cert-name "$MAIN_DOMAIN-bundle" "${DOMAINS_TO_CERT[@]}" --non-interactive --agree-tos -m "$EMAIL" 2>&1 | tee /tmp/certbot_output.log; then
-        print_success "SSL Certificates obtained successfully!"
+
+    # NOTE: redirect to a file and read the REAL exit code ($?). Do NOT pipe to
+    # tee — a pipeline's status is tee's status (always 0), which is what made
+    # the old script falsely report success.
+    certbot certonly --nginx --cert-name "$MAIN_DOMAIN-bundle" "${DOMAINS_TO_CERT[@]}" \
+        --non-interactive --agree-tos -m "$EMAIL" --keep-until-expiring > /tmp/certbot_bundle.log 2>&1
+    local rc=$?
+    sed 's/^/    /' /tmp/certbot_bundle.log
+
+    if [ $rc -eq 0 ] && [ -f "/etc/letsencrypt/live/$MAIN_DOMAIN-bundle/fullchain.pem" ]; then
+        print_success "Bundle certificate obtained for all ${#resolvable[@]} domain(s)."
         SSL_CERT_MODE="bundle"
         SSL_CERT_NAME="$MAIN_DOMAIN-bundle"
+        for domain in "${resolvable[@]}"; do
+            domain_ssl_status[$domain]="success"
+        done
         configure_ssl_in_nginx
+        print_ssl_summary
         return 0
     fi
-    
-    echo -e "  ${YELLOW}${CROSS}${NC} Bundle method failed. Trying alternative methods..."
+
+    print_warning "Bundle request failed — a single failing domain rejects the whole batch."
+    echo -e "  ${DIM}Reason(s) reported by Let's Encrypt:${NC}"
+    grep -E "Domain:|Type:|Detail:" /tmp/certbot_bundle.log | sed 's/^/    /'
     echo ""
-    
-    # Method 2: Try with standalone (temporarily stop nginx)
-    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Method 2:${NC} Using standalone authenticator..."
-    print_warning "This will temporarily stop Nginx"
-    
-    systemctl stop nginx
-    sleep 2
-    
-    if certbot certonly --standalone --cert-name "$MAIN_DOMAIN-bundle" "${DOMAINS_TO_CERT[@]}" --non-interactive --agree-tos -m "$EMAIL" 2>&1 | tee /tmp/certbot_output.log; then
-        systemctl start nginx
-        print_success "SSL Certificates obtained via standalone!"
-        SSL_CERT_MODE="bundle"
-        SSL_CERT_NAME="$MAIN_DOMAIN-bundle"
-        configure_ssl_in_nginx
-        return 0
-    fi
-    
-    systemctl start nginx
-    echo -e "  ${YELLOW}${CROSS}${NC} Standalone method failed. Trying individual domains..."
+    echo -e "  ${CYAN}${BULLET}${NC} Falling back to ${BOLD}per-domain${NC} requests to isolate the bad ones..."
+
+    # --- Stage 4: Per-domain isolation (same method that works manually) ---
     echo ""
-    
-    # Method 3: Try each domain individually with webroot
-    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Method 3:${NC} Requesting certificates individually (webroot)..."
-    
-    local success_count=0
-    for domain in "${!domain_ports[@]}"; do
-        echo -e "  ${CYAN}${ARROW}${NC} Attempting $domain..."
-        
-        if certbot certonly --webroot -w "$ACME_DIR" -d "$domain" --cert-name "$domain-cert" --non-interactive --agree-tos -m "$EMAIL" 2>&1 | tee /tmp/certbot_${domain}.log; then
-            echo -e "    ${GREEN}${CHECK}${NC} Success!"
-            success_count=$((success_count + 1))
+    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Stage 4 — Per-domain requests${NC}"
+    SSL_CERT_MODE="individual"
+    local ok=0
+    for domain in "${resolvable[@]}"; do
+        local logf="/tmp/certbot_$(safe_name "$domain").log"
+        echo -ne "    ${CYAN}${ARROW}${NC} ${WHITE}$domain${NC} ... "
+        certbot certonly --nginx --cert-name "$domain" -d "$domain" \
+            --non-interactive --agree-tos -m "$EMAIL" --keep-until-expiring > "$logf" 2>&1
+        if [ $? -eq 0 ] && [ -f "/etc/letsencrypt/live/$domain/fullchain.pem" ]; then
+            echo -e "${GREEN}${CHECK} issued${NC}"
+            domain_ssl_status[$domain]="success"
+            ok=$((ok + 1))
         else
-            echo -e "    ${RED}${CROSS}${NC} Failed for $domain"
+            local reason
+            reason=$(grep -E "Detail:" "$logf" | head -1 | sed 's/.*Detail: *//')
+            [[ -z "$reason" ]] && reason="see $logf"
+            echo -e "${RED}${CROSS} failed${NC} ${DIM}— $reason${NC}"
+            domain_ssl_status[$domain]="failed:$reason"
         fi
     done
-    
-    if [ $success_count -gt 0 ]; then
-        print_success "Obtained certificates for $success_count domain(s)"
-        SSL_CERT_MODE="individual"
+
+    if [ $ok -gt 0 ]; then
         configure_ssl_in_nginx
-        return 0
     fi
-    
-    echo -e "  ${YELLOW}${CROSS}${NC} Webroot method failed. Trying direct nginx method..."
-    echo ""
-    
-    # Method 4: Simple certbot --nginx for each domain
-    echo -e "  ${CYAN}${BULLET}${NC} ${BOLD}Method 4:${NC} Using certbot --nginx (auto-configure) individually..."
-    
-    success_count=0
-    for domain in "${!domain_ports[@]}"; do
-        echo -e "  ${CYAN}${ARROW}${NC} Attempting $domain with auto-config..."
-        
-        # This method auto-modifies nginx configs
-        if certbot --nginx -d "$domain" --non-interactive --agree-tos -m "$EMAIL" --redirect 2>&1 | tee /tmp/certbot_${domain}_auto.log; then
-            echo -e "    ${GREEN}${CHECK}${NC} Success!"
-            success_count=$((success_count + 1))
-        else
-            echo -e "    ${RED}${CROSS}${NC} Failed for $domain"
-        fi
-    done
-    
-    if [ $success_count -gt 0 ]; then
-        print_success "Successfully configured SSL for $success_count domain(s)!"
-        # Reload to ensure all changes are active
-        systemctl reload nginx
-        return 0
+
+    print_ssl_summary
+
+    if [ $ok -eq 0 ]; then
+        ssl_setup_failed
+        return 1
     fi
-    
-    # All methods failed
-    ssl_setup_failed
+    return 0
 }
 
 # --- Configure SSL in Nginx (for methods that use certonly) ---
@@ -898,7 +948,9 @@ configure_ssl_in_nginx() {
         fi
         
         if [[ -z "$cert_path" ]]; then
-            echo -e "${YELLOW}! No cert found${NC}"
+            echo -e "${YELLOW}! no cert on disk — leaving as HTTP${NC}"
+            # Don't overwrite a real failure reason captured earlier
+            [[ "${domain_ssl_status[$domain]}" == "success" ]] && domain_ssl_status[$domain]="failed:cert missing on disk"
             continue
         fi
         
@@ -952,13 +1004,19 @@ server {
     }
 }
 EOF
-        echo -e "${GREEN}${CHECK}${NC}"
+        echo -e "${GREEN}${CHECK} HTTPS configured${NC}"
+        domain_ssl_status[$domain]="success"
     done
-    
+
     echo ""
-    animate_dots "Applying SSL configuration" 2
-    systemctl restart nginx
-    print_success "HTTPS enabled for all domains!"
+    animate_dots "Validating & applying SSL configuration" 2
+    if nginx -t > /tmp/nginx_ssl_test.log 2>&1; then
+        systemctl reload nginx
+        print_success "Nginx reloaded with SSL configuration."
+    else
+        print_error "Nginx config test failed after enabling SSL — not reloading."
+        sed 's/^/    /' /tmp/nginx_ssl_test.log
+    fi
 }
 
 # --- SSL Setup Failure Handler ---
@@ -1057,12 +1115,15 @@ finalize() {
     echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     
     for domain in "${!domain_ports[@]}"; do
-        if [[ "$SETUP_SSL" == "yes" ]] && [ -f "/etc/letsencrypt/live/$MAIN_DOMAIN-bundle/fullchain.pem" ]; then
+        if [[ "$SETUP_SSL" == "yes" && "${domain_ssl_status[$domain]}" == "success" ]]; then
             echo -e "  ${GREEN}🔒${NC} https://${BOLD}$domain${NC}"
             echo -e "     ${CYAN}↳${NC} Backend: localhost:${domain_ports[$domain]}"
         else
             echo -e "  ${YELLOW}🌐${NC} http://${BOLD}$domain${NC}"
-            echo -e "     ${CYAN}↳${NC} Backend: localhost:${domain_ports[$domain]}"
+            local note=""
+            [[ "$SETUP_SSL" == "yes" && -n "${domain_ssl_status[$domain]}" && "${domain_ssl_status[$domain]}" != "success" ]] \
+                && note=" ${DIM}(SSL: ${domain_ssl_status[$domain]#failed:})${NC}"
+            echo -e "     ${CYAN}↳${NC} Backend: localhost:${domain_ports[$domain]}${note}"
         fi
     done
     
